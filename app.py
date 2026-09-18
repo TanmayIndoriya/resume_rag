@@ -81,6 +81,8 @@ else:
                 st.markdown(result["answer"])
                 with st.expander("Retrieved context (what the model saw)"):
                     for i, chunk in enumerate(result.get("sources", []), start=1):
-                        st.markdown(f"**Chunk {i}:** {chunk}")
+                        section = chunk.get("section", "General")
+                        text = chunk.get("text", "")
+                        st.markdown(f"**Chunk {i} — _{section}_:** {text}")
 
         st.session_state.chat_history.append({"role": "assistant", "content": result["answer"]})

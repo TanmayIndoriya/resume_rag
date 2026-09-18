@@ -5,18 +5,21 @@ Core RAG (Retrieval-Augmented Generation) logic for the Resume RAG project.
 
 Pipeline stages:
 1. Ingest      -> extract raw text from an uploaded resume PDF
-2. Chunk       -> split text into overlapping chunks (so context isn't lost at boundaries)
-3. Embed       -> turn each chunk into a vector using a local sentence-transformer model
-4. Store       -> persist chunks + vectors in a local Chroma vector database
-5. Retrieve    -> given a user question, embed it and pull the top-k most similar chunks
-6. Generate    -> feed the question + retrieved chunks to an LLM (Groq/Llama) to produce
-                  a grounded answer. Falls back to a plain "extractive" mode with no LLM
-                  key is configured, so the demo still works end-to-end with zero cost.
+2. Section-split -> split text into resume sections (Experience, Education, Skills...)
+3. Chunk       -> split each section into overlapping chunks (so context isn't lost
+                  at boundaries), tagging every chunk with its source section
+4. Embed       -> turn each chunk into a vector using a local sentence-transformer model
+5. Store       -> persist chunks + vectors + section metadata in a local Chroma vector DB
+6. Retrieve    -> given a user question, embed it and pull the top-k most similar chunks
+7. Generate    -> feed the question + retrieved chunks to an LLM (Groq) to produce
+                  a grounded answer. Falls back to a plain "retrieval-only" mode if no
+                  LLM key is configured, so the demo still works end-to-end at zero cost.
 """
 
 import os
+import re
 import uuid
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
 
 import chromadb
 from chromadb.utils import embedding_functions
@@ -32,18 +35,77 @@ except ImportError:
 CHUNK_SIZE = 500       # characters per chunk
 CHUNK_OVERLAP = 100    # characters shared between consecutive chunks
 TOP_K = 4              # number of chunks retrieved per query
-EMBED_MODEL_NAME = "all-MiniLM-L6-v2"   # small, fast, runs locally, no API needed
-LLM_MODEL_NAME = "openai/gpt-oss-20b"
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"     # small, fast, runs locally, no API needed
+LLM_MODEL_NAME = "openai/gpt-oss-20b"     # served for free via Groq
+
+# Common resume section headings. Matching is case-insensitive and tolerant of
+# variants ("Work Experience", "Professional Experience", "Experience" all match).
+SECTION_HEADERS = [
+    "summary", "professional summary", "objective", "profile",
+    "experience", "work experience", "professional experience",
+    "employment history", "relevant experience",
+    "education", "academic background", "academic qualifications",
+    "skills", "technical skills", "core competencies", "key skills",
+    "projects", "personal projects", "academic projects",
+    "certifications", "certificates", "licenses",
+    "achievements", "accomplishments", "awards", "honors",
+    "publications",
+    "volunteer experience", "volunteering", "community involvement",
+    "leadership", "extracurricular activities",
+    "languages",
+    "interests", "hobbies",
+    "contact", "contact information",
+]
 
 
 def extract_text_from_pdf(file_path: str) -> str:
-    """Extract raw text from a PDF resume."""
+    """Extract raw text from a PDF resume, preserving line breaks (needed for
+    section-header detection)."""
     reader = PdfReader(file_path)
     pages_text = []
     for page in reader.pages:
         text = page.extract_text() or ""
         pages_text.append(text)
     return "\n".join(pages_text)
+
+
+def _is_section_header(line: str) -> Optional[str]:
+    """Return the cleaned header name if `line` looks like a resume section
+    heading, else None. Headings are short lines that match (or start with)
+    one of SECTION_HEADERS."""
+    cleaned = line.strip().strip(":").strip()
+    if not cleaned or len(cleaned) > 40:
+        return None
+    lowered = re.sub(r"[^a-z\s]", "", cleaned.lower()).strip()
+    for header in SECTION_HEADERS:
+        if lowered == header or lowered.startswith(header):
+            return cleaned
+    return None
+
+
+def split_into_sections(raw_text: str) -> List[Tuple[str, str]]:
+    """Split resume text into (section_name, section_text) pairs based on
+    detected headings. Text before the first recognized heading is grouped
+    under 'General'."""
+    lines = raw_text.split("\n")
+    sections: List[Tuple[str, str]] = []
+    current_name = "General"
+    current_lines: List[str] = []
+
+    for line in lines:
+        header = _is_section_header(line)
+        if header:
+            if current_lines:
+                sections.append((current_name, "\n".join(current_lines)))
+            current_name = header
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        sections.append((current_name, "\n".join(current_lines)))
+
+    return sections
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
@@ -58,6 +120,27 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
         end = start + chunk_size
         chunks.append(text[start:end])
         start += chunk_size - overlap
+    return chunks
+
+
+def chunk_resume(raw_text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[Dict]:
+    """Section-aware chunking: split into resume sections first, then chunk
+    within each section. Every chunk keeps its section name as metadata, which
+    both improves retrieval (sections are semantically coherent) and lets the
+    UI show *where in the resume* an answer came from."""
+    sections = split_into_sections(raw_text)
+    chunks: List[Dict] = []
+
+    for section_name, section_text in sections:
+        normalized = " ".join(section_text.split())
+        if not normalized:
+            continue
+        if len(normalized) <= chunk_size:
+            chunks.append({"text": normalized, "section": section_name})
+        else:
+            for sub_chunk in chunk_text(normalized, chunk_size, overlap):
+                chunks.append({"text": sub_chunk, "section": section_name})
+
     return chunks
 
 
@@ -85,26 +168,44 @@ class ResumeRAG:
             self.groq_client = Groq(api_key=api_key)
 
     def index_resume(self, pdf_path: str) -> int:
-        """Extract, chunk, embed, and store the resume. Returns number of chunks indexed."""
+        """Extract, section-split, chunk, embed, and store the resume.
+        Returns number of chunks indexed."""
         raw_text = extract_text_from_pdf(pdf_path)
-        chunks = chunk_text(raw_text)
+        chunks = chunk_resume(raw_text)
 
         if not chunks:
             raise ValueError("No extractable text found in the PDF. Is it a scanned image?")
 
         ids = [str(uuid.uuid4()) for _ in chunks]
-        self.collection.add(documents=chunks, ids=ids)
+        documents = [c["text"] for c in chunks]
+        metadatas = [{"section": c["section"]} for c in chunks]
+        self.collection.add(documents=documents, metadatas=metadatas, ids=ids)
         return len(chunks)
 
-    def retrieve(self, query: str, k: int = TOP_K) -> List[str]:
-        """Return the top-k chunks most relevant to the query."""
-        results = self.collection.query(query_texts=[query], n_results=k)
-        return results["documents"][0] if results["documents"] else []
+    def retrieve(self, query: str, k: int = TOP_K) -> List[Dict]:
+        """Return the top-k chunks most relevant to the query, each as
+        {"text": ..., "section": ..., "distance": ...}."""
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=k,
+            include=["documents", "metadatas", "distances"],
+        )
+        if not results["documents"] or not results["documents"][0]:
+            return []
 
-    def generate_answer(self, query: str, context_chunks: List[str]) -> Dict:
+        docs = results["documents"][0]
+        metas = results["metadatas"][0]
+        dists = results["distances"][0]
+
+        return [
+            {"text": doc, "section": meta.get("section", "General"), "distance": dist}
+            for doc, meta, dist in zip(docs, metas, dists)
+        ]
+
+    def generate_answer(self, query: str, retrieved: List[Dict]) -> Dict:
         """Generate a grounded answer using retrieved context. Falls back to
-        extractive mode (just showing the chunks) if no LLM API key is set."""
-        context = "\n---\n".join(context_chunks)
+        retrieval-only mode if no LLM API key is set."""
+        context = "\n---\n".join(f"[{r['section']}] {r['text']}" for r in retrieved)
 
         if self.groq_client is None:
             return {
@@ -136,10 +237,10 @@ class ResumeRAG:
 
     def ask(self, query: str, k: int = TOP_K) -> Dict:
         """End-to-end: retrieve relevant chunks, then generate an answer."""
-        chunks = self.retrieve(query, k=k)
-        if not chunks:
+        retrieved = self.retrieve(query, k=k)
+        if not retrieved:
             return {"answer": "No resume has been indexed yet, or no relevant content was found.",
                     "mode": "none", "sources": []}
-        result = self.generate_answer(query, chunks)
-        result["sources"] = chunks
+        result = self.generate_answer(query, retrieved)
+        result["sources"] = retrieved
         return result
